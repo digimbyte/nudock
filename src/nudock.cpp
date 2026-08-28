@@ -12,8 +12,9 @@
 #include <QMenu>
 #include <QTimer>
 
-#include <array>
 #include <memory>
+#include <optional>
+#include <utility>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_AUTHOR(PLUGIN_AUTHOR)
@@ -46,10 +47,33 @@ void obs_module_unload() { moduleInstance.reset(); }
 
 NuDock::NuDock(QMainWindow *mainWindow_)
     : QObject(mainWindow_), mainWindow(mainWindow_),
-      store(moduleConfigDirectory()) {}
+      store(moduleConfigDirectory()),
+      restoreCoordinator(
+          []() { return currentObsProfile(); },
+          [this](const QString &obsProfileName) {
+            return store.mappingFor(obsProfileName);
+          },
+          [this](const QString &dockProfileId)
+              -> std::optional<DockRestoreSnapshot> {
+            const DockProfile *profile = store.profile(dockProfileId);
+            if (!profile)
+              return std::nullopt;
+            return DockRestoreSnapshot{profile->id, profile->name,
+                                       profile->qtStateVersion, profile->state};
+          },
+          [this](const QByteArray &state, int stateVersion, QString *error) {
+            return restoreStateTransactional(state, stateVersion, error);
+          },
+          [this](int delay, std::function<void()> callback) {
+            QTimer::singleShot(delay, this, std::move(callback));
+          },
+          [](const QString &message) {
+            blog(LOG_ERROR, "[%s] %s", PLUGIN_NAME,
+                 message.toUtf8().constData());
+          }) {}
 
 NuDock::~NuDock() {
-  ++restoreGeneration;
+  restoreCoordinator.cancel();
   obs_frontend_remove_event_callback(frontendEvent, this);
   if (managerDialog)
     managerDialog->close();
@@ -128,8 +152,7 @@ void NuDock::showManager() {
                         knownCurrentObsProfile);
 
   if (managerDialog) {
-    managerDialog->refreshObsProfiles(knownObsProfiles,
-                                      knownCurrentObsProfile,
+    managerDialog->refreshObsProfiles(knownObsProfiles, knownCurrentObsProfile,
                                       previousCurrent);
     managerDialog->show();
     managerDialog->raise();
@@ -142,8 +165,8 @@ void NuDock::showManager() {
       []() { return QString::fromUtf8(obs_get_version_string()); },
       [this]() { return mainWindow->saveState(DockStateVersion); },
       [this](const QByteArray &state, QString *error) {
-        ++restoreGeneration;
-        return restoreStateTransactional(state, error);
+        restoreCoordinator.cancel();
+        return restoreStateTransactional(state, DockStateVersion, error);
       },
       [this](const DockProfileStore &candidate, QString *error) {
         return applyStore(candidate, error);
@@ -161,8 +184,9 @@ bool NuDock::applyStore(const DockProfileStore &candidate, QString *error) {
   store = candidate;
   const QString newDockProfile = store.mappingFor(activeObsProfile);
   if (oldDockProfile != newDockProfile) {
-    ++restoreGeneration;
-    if (!newDockProfile.isEmpty())
+    if (newDockProfile.isEmpty())
+      restoreCoordinator.cancel();
+    else
       scheduleRestoreForCurrentProfile();
   }
   return true;
@@ -193,8 +217,7 @@ void NuDock::handleObsProfileEvent(enum obs_frontend_event event) {
                         knownCurrentObsProfile, allowRenameTransfer);
 
   if (managerDialog)
-    managerDialog->refreshObsProfiles(knownObsProfiles,
-                                      knownCurrentObsProfile,
+    managerDialog->refreshObsProfiles(knownObsProfiles, knownCurrentObsProfile,
                                       previousCurrent, allowRenameTransfer);
 
   if (event == OBS_FRONTEND_EVENT_PROFILE_CHANGED) {
@@ -206,55 +229,12 @@ void NuDock::handleObsProfileEvent(enum obs_frontend_event event) {
 }
 
 void NuDock::scheduleRestoreForCurrentProfile() {
-  const QString obsProfileName = currentObsProfile();
-  const QString dockProfileId = store.mappingFor(obsProfileName);
-  const quint64 generation = ++restoreGeneration;
-  reportedRestoreErrorGeneration = 0;
-  if (obsProfileName.isEmpty() || dockProfileId.isEmpty())
-    return;
-
-  constexpr std::array<int, 3> delays{0, 250, 1000};
-  for (const int delay : delays) {
-    QTimer::singleShot(delay, this,
-                       [this, generation, obsProfileName, dockProfileId]() {
-                         attemptScheduledRestore(generation, obsProfileName,
-                                                 dockProfileId);
-                       });
-  }
-}
-
-void NuDock::attemptScheduledRestore(quint64 generation,
-                                     const QString &obsProfileName,
-                                     const QString &dockProfileId) {
-  if (generation != restoreGeneration ||
-      currentObsProfile() != obsProfileName ||
-      store.mappingFor(obsProfileName) != dockProfileId)
-    return;
-
-  const DockProfile *profile = store.profile(dockProfileId);
-  if (!profile) {
-    if (reportedRestoreErrorGeneration != generation) {
-      reportedRestoreErrorGeneration = generation;
-      blog(LOG_ERROR, "[%s] mapped Dock Profile '%s' is unavailable",
-           PLUGIN_NAME, dockProfileId.toUtf8().constData());
-    }
-    return;
-  }
-
-  QString error;
-  if (!restoreStateTransactional(profile->state, &error) &&
-      reportedRestoreErrorGeneration != generation) {
-    reportedRestoreErrorGeneration = generation;
-    blog(LOG_ERROR, "[%s] could not restore Dock Profile '%s': %s",
-         PLUGIN_NAME, profile->name.toUtf8().constData(),
-         error.toUtf8().constData());
-  }
+  restoreCoordinator.scheduleForCurrentProfile();
 }
 
 bool NuDock::restoreStateTransactional(const QByteArray &state,
-                                       QString *error) {
-  return restoreDockStateTransactional(*mainWindow, state, DockStateVersion,
-                                       error);
+                                       int stateVersion, QString *error) {
+  return restoreDockStateTransactional(*mainWindow, state, stateVersion, error);
 }
 
 void NuDock::frontendEvent(enum obs_frontend_event event, void *data) {

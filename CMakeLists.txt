@@ -13,6 +13,8 @@ target_sources(
     src/dock_profile_manager_dialog.hpp
     src/dock_profile_store.cpp
     src/dock_profile_store.hpp
+    src/dock_restore_coordinator.cpp
+    src/dock_restore_coordinator.hpp
     src/dock_state_restorer.cpp
     src/dock_state_restorer.hpp
     src/nudock.cpp
@@ -67,6 +69,8 @@ if(NUDOCK_BUILD_TESTS)
     tests/dock_profile_store_test.cpp
     src/dock_profile_store.cpp
     src/dock_profile_store.hpp
+    src/dock_restore_coordinator.cpp
+    src/dock_restore_coordinator.hpp
     src/dock_state_restorer.cpp
     src/dock_state_restorer.hpp
   )

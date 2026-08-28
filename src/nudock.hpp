@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dock_profile_store.hpp"
+#include "dock_restore_coordinator.hpp"
 
 #include <obs-frontend-api.h>
 
@@ -30,19 +31,15 @@ private:
   QAction *docksAction = nullptr;
   QPointer<DockProfileManagerDialog> managerDialog;
   DockProfileStore store;
+  DockRestoreCoordinator restoreCoordinator;
   QStringList knownObsProfiles;
   QString knownCurrentObsProfile;
-  quint64 restoreGeneration = 0;
-  quint64 reportedRestoreErrorGeneration = 0;
   bool profileChangingEventSeen = false;
 
   void showManager();
   void handleObsProfileEvent(enum obs_frontend_event event);
   void scheduleRestoreForCurrentProfile();
-  void attemptScheduledRestore(quint64 generation,
-                               const QString &obsProfileName,
-                               const QString &dockProfileId);
-  bool restoreStateTransactional(const QByteArray &state,
+  bool restoreStateTransactional(const QByteArray &state, int stateVersion,
                                  QString *error = nullptr);
   bool applyStore(const DockProfileStore &candidate, QString *error);
   bool reconcileStoreWithObs(const QStringList &profiles,
