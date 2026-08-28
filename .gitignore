@@ -1,0 +1,28 @@
+# Local compatibility and integration test environments. These are never
+# NuDock source or release inputs.
+/artifacts/
+/build/
+/deps/
+
+# The inherited obsPlugins checkout is retained locally as an OBS integration
+# harness. Only the NuDock plugin subtree belongs to this repository.
+/jr/*
+!/jr/jrdockie/
+/jr/jrdockie/release/
+/jr/jrdockie/release-global/
+
+# Generated build and packaging outputs.
+*.dll
+*.exe
+*.exp
+*.ilk
+*.lib
+*.obj
+*.pdb
+*.zip
+/.vs/
+**/.vs/
+
+# Local operating-system metadata.
+desktop.ini
+Thumbs.db
