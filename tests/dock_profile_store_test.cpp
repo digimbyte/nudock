@@ -1,4 +1,5 @@
 #include "dock_profile_store.hpp"
+#include "dock_restore_coordinator.hpp"
 #include "dock_state_restorer.hpp"
 
 #include <QApplication>
@@ -10,6 +11,7 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QMainWindow>
+#include <QMap>
 #include <QTemporaryDir>
 
 #include <functional>
@@ -19,9 +21,30 @@
 #include <vector>
 
 namespace {
+struct ScheduledRestore {
+  int delay = 0;
+  std::function<void()> callback;
+};
+
 void require(bool condition, const char *message) {
   if (!condition)
     throw std::runtime_error(message);
+}
+
+QDockWidget *addTestDock(QMainWindow &window, const QString &id,
+                         Qt::DockWidgetArea area) {
+  auto *dock = new QDockWidget(id, &window);
+  dock->setObjectName(id);
+  dock->setWidget(new QLabel(id, dock));
+  window.addDockWidget(area, dock);
+  return dock;
+}
+
+void runScheduled(std::vector<ScheduledRestore> &scheduled) {
+  std::vector<ScheduledRestore> pending = std::move(scheduled);
+  scheduled.clear();
+  for (ScheduledRestore &task : pending)
+    task.callback();
 }
 
 void crudRoundTripAndSharedMappings() {
@@ -31,12 +54,12 @@ void crudRoundTripAndSharedMappings() {
   DockProfileStore store(directory.path());
   QString error;
   require(store.load(&error), qPrintable(error));
-  const QString mainId = store.createProfile(
-      QStringLiteral("Main"), QByteArray("state-main"),
-      QStringLiteral("32.1.0"), &error);
-  const QString editId = store.createProfile(
-      QStringLiteral("Editing"), QByteArray("state-edit"),
-      QStringLiteral("32.1.0"), &error);
+  const QString mainId =
+      store.createProfile(QStringLiteral("Main"), QByteArray("state-main"),
+                          QStringLiteral("32.1.0"), &error);
+  const QString editId =
+      store.createProfile(QStringLiteral("Editing"), QByteArray("state-edit"),
+                          QStringLiteral("32.1.0"), &error);
   require(!mainId.isEmpty(), qPrintable(error));
   require(!editId.isEmpty(), qPrintable(error));
   store.setMapping(QStringLiteral("Streaming"), mainId);
@@ -79,17 +102,20 @@ void duplicateAndEmptyStatesAreRejected() {
   DockProfileStore store(directory.path());
   QString error;
   require(store.load(&error), qPrintable(error));
-  require(!store.createProfile(QStringLiteral("Main"), QByteArray("state"),
-                               QStringLiteral("32.1.0"), &error)
+  require(!store
+               .createProfile(QStringLiteral("Main"), QByteArray("state"),
+                              QStringLiteral("32.1.0"), &error)
                .isEmpty(),
           qPrintable(error));
-  require(store.createProfile(QStringLiteral("main"), QByteArray("other"),
-                              QStringLiteral("32.1.0"), &error)
+  require(store
+              .createProfile(QStringLiteral("main"), QByteArray("other"),
+                             QStringLiteral("32.1.0"), &error)
               .isEmpty(),
           "case-insensitive duplicate name was accepted");
   require(!error.isEmpty(), "duplicate name did not report an error");
-  require(store.createProfile(QStringLiteral("Empty"), {},
-                              QStringLiteral("32.1.0"), &error)
+  require(store
+              .createProfile(QStringLiteral("Empty"), {},
+                             QStringLiteral("32.1.0"), &error)
               .isEmpty(),
           "empty dock state was accepted");
 }
@@ -100,9 +126,9 @@ void deletionClearsMappingsAndFiles() {
   DockProfileStore store(directory.path());
   QString error;
   require(store.load(&error), qPrintable(error));
-  const QString id = store.createProfile(QStringLiteral("Temporary"),
-                                         QByteArray("state"),
-                                         QStringLiteral("32.1.0"), &error);
+  const QString id =
+      store.createProfile(QStringLiteral("Temporary"), QByteArray("state"),
+                          QStringLiteral("32.1.0"), &error);
   store.setMapping(QStringLiteral("One"), id);
   store.setMapping(QStringLiteral("Two"), id);
   require(store.commit(&error), qPrintable(error));
@@ -122,9 +148,8 @@ void renameTransferIsDistinctFromDeletion() {
   DockProfileStore store(directory.path());
   QString error;
   require(store.load(&error), qPrintable(error));
-  const QString id = store.createProfile(QStringLiteral("Main"),
-                                         QByteArray("state"),
-                                         QStringLiteral("32.1.0"));
+  const QString id = store.createProfile(
+      QStringLiteral("Main"), QByteArray("state"), QStringLiteral("32.1.0"));
   store.setMapping(QStringLiteral("Old Name"), id);
   require(store.reconcileObsProfiles({QStringLiteral("New Name")},
                                      QStringLiteral("Old Name"),
@@ -150,8 +175,7 @@ void corruptAndMissingProfilesAreReported() {
   require(QDir().mkpath(QDir(directory.path()).filePath("profiles")),
           "profile directory creation failed");
 
-  QFile corrupt(
-      QDir(directory.path()).filePath("profiles/not-a-profile.json"));
+  QFile corrupt(QDir(directory.path()).filePath("profiles/not-a-profile.json"));
   require(corrupt.open(QIODevice::WriteOnly), "corrupt fixture open failed");
   corrupt.write("{not-json");
   corrupt.close();
@@ -177,6 +201,193 @@ void corruptAndMissingProfilesAreReported() {
           "corrupt and missing profile issues were not both reported");
 }
 
+void mappedProfileTransitionsUseCurrentSnapshot() {
+  QString currentProfile = QStringLiteral("Profile A");
+  QMap<QString, QString> mappings{
+      {QStringLiteral("Profile A"), QStringLiteral("dock-a")},
+      {QStringLiteral("Profile B"), QStringLiteral("dock-b")},
+  };
+  QMap<QString, DockRestoreSnapshot> snapshots{
+      {QStringLiteral("dock-a"),
+       {QStringLiteral("dock-a"), QStringLiteral("Layout A"), 1,
+        QByteArray("state-a")}},
+      {QStringLiteral("dock-b"),
+       {QStringLiteral("dock-b"), QStringLiteral("Layout B"), 1,
+        QByteArray("state-b")}},
+  };
+  std::vector<ScheduledRestore> scheduled;
+  std::vector<QByteArray> restored;
+  QStringList errors;
+
+  DockRestoreCoordinator coordinator(
+      [&]() { return currentProfile; },
+      [&](const QString &profile) { return mappings.value(profile); },
+      [&](const QString &id) -> std::optional<DockRestoreSnapshot> {
+        const auto it = snapshots.constFind(id);
+        return it == snapshots.constEnd()
+                   ? std::nullopt
+                   : std::optional<DockRestoreSnapshot>(*it);
+      },
+      [&](const QByteArray &state, int version, QString *) {
+        require(version == 1, "unexpected Qt state version");
+        restored.push_back(state);
+        return true;
+      },
+      [&](int delay, std::function<void()> callback) {
+        scheduled.push_back({delay, std::move(callback)});
+      },
+      [&](const QString &error) { errors.push_back(error); });
+
+  coordinator.scheduleForCurrentProfile();
+  require(scheduled.size() == 3, "assigned profile did not schedule retries");
+  require(scheduled[0].delay == 0 && scheduled[1].delay == 250 &&
+              scheduled[2].delay == 1000,
+          "restore retry delays changed");
+  runScheduled(scheduled);
+  require(restored.size() == 3, "assigned snapshot was not retried");
+  for (const QByteArray &state : restored)
+    require(state == QByteArray("state-a"),
+            "Profile A restored the wrong Dock Profile");
+
+  restored.clear();
+  mappings.remove(QStringLiteral("Profile A"));
+  coordinator.scheduleForCurrentProfile();
+  require(scheduled.empty(), "Keep Current scheduled a restoration");
+  require(restored.empty(), "Keep Current changed the layout");
+
+  mappings.insert(QStringLiteral("Profile A"), QStringLiteral("dock-b"));
+  coordinator.scheduleForCurrentProfile();
+  runScheduled(scheduled);
+  require(restored.size() == 3, "active mapping change was not restored");
+  for (const QByteArray &state : restored)
+    require(state == QByteArray("state-b"),
+            "active mapping change restored the old snapshot");
+
+  restored.clear();
+  mappings.insert(QStringLiteral("Profile A"), QStringLiteral("dock-a"));
+  coordinator.scheduleForCurrentProfile();
+  currentProfile = QStringLiteral("Profile B");
+  coordinator.scheduleForCurrentProfile();
+  runScheduled(scheduled);
+  require(restored.size() == 3,
+          "rapid switch did not cancel exactly the stale retries");
+  for (const QByteArray &state : restored)
+    require(state == QByteArray("state-b"),
+            "stale Profile A retry overwrote Profile B");
+  require(errors.isEmpty(), "valid mapped transitions reported an error");
+}
+
+void missingSnapshotIsReportedOnce() {
+  std::vector<ScheduledRestore> scheduled;
+  QStringList errors;
+  DockRestoreCoordinator coordinator(
+      []() { return QStringLiteral("OBS"); },
+      [](const QString &) { return QStringLiteral("missing"); },
+      [](const QString &) -> std::optional<DockRestoreSnapshot> {
+        return std::nullopt;
+      },
+      [](const QByteArray &, int, QString *) { return true; },
+      [&](int delay, std::function<void()> callback) {
+        scheduled.push_back({delay, std::move(callback)});
+      },
+      [&](const QString &error) { errors.push_back(error); });
+  coordinator.scheduleForCurrentProfile();
+  runScheduled(scheduled);
+  require(errors.size() == 1, "missing snapshot error was not deduplicated");
+}
+
+void customDockLayoutRoundTrips() {
+  QMainWindow window;
+  window.resize(900, 600);
+  auto *core =
+      addTestDock(window, QStringLiteral("coreDock"), Qt::LeftDockWidgetArea);
+  auto *custom = addTestDock(window, QStringLiteral("plugin.custom.primary"),
+                             Qt::RightDockWidgetArea);
+  auto *tabbed = addTestDock(window, QStringLiteral("plugin.custom.tabbed"),
+                             Qt::RightDockWidgetArea);
+  auto *hidden = addTestDock(window, QStringLiteral("plugin.custom.hidden"),
+                             Qt::BottomDockWidgetArea);
+  auto *floating = addTestDock(window, QStringLiteral("plugin.custom.floating"),
+                               Qt::BottomDockWidgetArea);
+  window.tabifyDockWidget(custom, tabbed);
+  window.show();
+  hidden->hide();
+  floating->setFloating(true);
+  floating->show();
+  tabbed->raise();
+  QApplication::processEvents();
+  const QByteArray saved = window.saveState(1);
+  require(!saved.isEmpty(), "custom dock snapshot was empty");
+
+  window.addDockWidget(Qt::BottomDockWidgetArea, core);
+  window.addDockWidget(Qt::LeftDockWidgetArea, custom);
+  window.addDockWidget(Qt::BottomDockWidgetArea, tabbed);
+  hidden->show();
+  floating->setFloating(false);
+  window.addDockWidget(Qt::LeftDockWidgetArea, floating);
+  QApplication::processEvents();
+
+  QString error;
+  require(restoreDockStateTransactional(window, saved, 1, &error),
+          qPrintable(error));
+  QApplication::processEvents();
+  require(window.dockWidgetArea(core) == Qt::LeftDockWidgetArea,
+          "core dock area was not restored");
+  require(window.dockWidgetArea(custom) == Qt::RightDockWidgetArea,
+          "custom dock area was not restored");
+  require(window.tabifiedDockWidgets(custom).contains(tabbed),
+          "custom dock tab group was not restored");
+  require(!hidden->isVisible(), "custom dock visibility was not restored");
+  require(floating->isFloating(),
+          "custom dock floating state was not restored");
+}
+
+void lateCustomDockIsRestoredByRetry() {
+  QMainWindow source;
+  source.resize(800, 500);
+  addTestDock(source, QStringLiteral("coreDock"), Qt::LeftDockWidgetArea);
+  addTestDock(source, QStringLiteral("plugin.custom.late"),
+              Qt::RightDockWidgetArea);
+  source.show();
+  QApplication::processEvents();
+  const QByteArray state = source.saveState(1);
+
+  QMainWindow target;
+  target.resize(800, 500);
+  addTestDock(target, QStringLiteral("coreDock"), Qt::LeftDockWidgetArea);
+  target.show();
+  QApplication::processEvents();
+
+  std::vector<ScheduledRestore> scheduled;
+  DockRestoreCoordinator coordinator(
+      []() { return QStringLiteral("OBS"); },
+      [](const QString &) { return QStringLiteral("layout"); },
+      [&](const QString &) -> std::optional<DockRestoreSnapshot> {
+        return DockRestoreSnapshot{QStringLiteral("layout"),
+                                   QStringLiteral("Layout"), 1, state};
+      },
+      [&](const QByteArray &restoreState, int version, QString *error) {
+        return restoreDockStateTransactional(target, restoreState, version,
+                                             error);
+      },
+      [&](int delay, std::function<void()> callback) {
+        scheduled.push_back({delay, std::move(callback)});
+      },
+      [](const QString &) {});
+
+  coordinator.scheduleForCurrentProfile();
+  require(scheduled.size() == 3, "late dock retries were not scheduled");
+  scheduled[0].callback();
+  auto *late = addTestDock(target, QStringLiteral("plugin.custom.late"),
+                           Qt::LeftDockWidgetArea);
+  QApplication::processEvents();
+  scheduled[1].callback();
+  scheduled[2].callback();
+  QApplication::processEvents();
+  require(target.dockWidgetArea(late) == Qt::RightDockWidgetArea,
+          "late custom dock did not restore on a delayed retry");
+}
+
 void transactionalRestoreRollsBackInvalidState() {
   QMainWindow window;
   auto *left = new QDockWidget(QStringLiteral("Left"), &window);
@@ -198,9 +409,9 @@ void transactionalRestoreRollsBackInvalidState() {
           qPrintable(error));
 
   const QByteArray beforeInvalid = window.saveState(1);
-  require(!restoreDockStateTransactional(window, QByteArray("invalid"), 1,
-                                         &error),
-          "invalid state was accepted");
+  require(
+      !restoreDockStateTransactional(window, QByteArray("invalid"), 1, &error),
+      "invalid state was accepted");
   require(window.saveState(1) == beforeInvalid,
           "invalid restore did not roll back the layout");
   require(!error.isEmpty(), "invalid restore did not report an error");
@@ -217,6 +428,11 @@ int main(int argc, char **argv) {
       {"OBS profile rename and deletion reconciliation",
        renameTransferIsDistinctFromDeletion},
       {"corrupt and missing profiles", corruptAndMissingProfilesAreReported},
+      {"mapped profile transitions and rapid switching",
+       mappedProfileTransitionsUseCurrentSnapshot},
+      {"missing snapshot error reporting", missingSnapshotIsReportedOnce},
+      {"custom dock layout round-trip", customDockLayoutRoundTrips},
+      {"late custom dock retry", lateCustomDockIsRestoredByRetry},
       {"transactional restore rollback",
        transactionalRestoreRollsBackInvalidState},
   };
@@ -229,8 +445,7 @@ int main(int argc, char **argv) {
       std::cout << "PASS: " << name << std::endl;
     } catch (const std::exception &exception) {
       ++failures;
-      std::cerr << "FAIL: " << name << ": " << exception.what()
-                << std::endl;
+      std::cerr << "FAIL: " << name << ": " << exception.what() << std::endl;
     }
   }
   return failures == 0 ? 0 : 1;

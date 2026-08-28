@@ -54,7 +54,9 @@ Enable the self-contained Qt test executable with:
 
 The suite covers serialization, atomic writes, duplicate names, CRUD,
 many-to-one mappings, OBS profile rename/delete reconciliation, corrupt and
-missing files, and transactional restore rollback.
+missing files, mapped profile transitions, rapid-switch cancellation, custom
+dock layout round-trips, late dock registration, and transactional restore
+rollback.
 
 Compatibility targets are OBS Studio 32.1 and 32.2 on Windows x64. Local OBS
 source trees, portable installations, build outputs, packages, DLLs, and PDBs
