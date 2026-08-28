@@ -4,12 +4,9 @@
 /build/
 /deps/
 
-# The inherited obsPlugins checkout is retained locally as an OBS integration
-# harness. Only the NuDock plugin subtree belongs to this repository.
-/jr/*
-!/jr/jrdockie/
-/jr/jrdockie/release/
-/jr/jrdockie/release-global/
+# The inherited obsPlugins checkout is retained locally as an ignored OBS
+# integration harness. NuDock source lives at the repository root.
+/jr/
 
 # Generated build and packaging outputs.
 *.dll
