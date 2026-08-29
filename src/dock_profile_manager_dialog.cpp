@@ -3,6 +3,7 @@
 #include <obs-module.h>
 
 #include <QComboBox>
+#include <QCloseEvent>
 #include <QDialogButtonBox>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -26,13 +27,17 @@ DockProfileManagerDialog::DockProfileManagerDialog(
     QWidget *parent, const DockProfileStore &store,
     const QStringList &obsProfiles_, const QString &currentObsProfile_,
     ObsVersionProvider obsVersionProvider_, StateProvider stateProvider_,
-    LoadCallback loadCallback_, ApplyCallback applyCallback_)
+    DockIdsProvider dockIdsProvider_, LoadCallback loadCallback_,
+    ApplyCallback applyCallback_, ProfileCommitCallback profileCommitCallback_)
     : QDialog(parent), workingStore(store), obsProfiles(obsProfiles_),
+      appliedMappings(store.mappings()),
       currentObsProfile(currentObsProfile_),
       obsVersionProvider(std::move(obsVersionProvider_)),
       stateProvider(std::move(stateProvider_)),
+      dockIdsProvider(std::move(dockIdsProvider_)),
       loadCallback(std::move(loadCallback_)),
-      applyCallback(std::move(applyCallback_)) {
+      applyCallback(std::move(applyCallback_)),
+      profileCommitCallback(std::move(profileCommitCallback_)) {
   buildUi();
   rebuildProfileList();
   rebuildMappingTable();
@@ -46,11 +51,11 @@ void DockProfileManagerDialog::buildUi() {
   issueLabel = new QLabel(this);
   issueLabel->setWordWrap(true);
   issueLabel->setStyleSheet(QStringLiteral("color: #d98b2b;"));
+  root->addWidget(issueLabel);
   if (workingStore.issues().isEmpty()) {
     issueLabel->hide();
   } else {
     issueLabel->setText(workingStore.issues().join(QLatin1Char('\n')));
-    root->addWidget(issueLabel);
   }
 
   auto *profilesGroup = new QGroupBox(text("Dock Profiles"), this);
@@ -113,7 +118,8 @@ void DockProfileManagerDialog::buildUi() {
   connect(buttonBox->button(QDialogButtonBox::Ok), &QPushButton::clicked, this,
           [this]() { applyChanges(true); });
   connect(buttonBox->button(QDialogButtonBox::Cancel), &QPushButton::clicked,
-          this, &QDialog::reject);
+          this, &DockProfileManagerDialog::reject);
+  updatePendingState();
 }
 
 QString DockProfileManagerDialog::selectedProfileId() const {
@@ -171,8 +177,14 @@ void DockProfileManagerDialog::rebuildMappingTable() {
     const int mappedIndex =
         combo->findData(workingStore.mappingFor(obsProfile));
     combo->setCurrentIndex(mappedIndex >= 0 ? mappedIndex : 0);
+    connect(combo, &QComboBox::currentIndexChanged, this,
+            [this]() {
+              syncMappingsFromTable();
+              updatePendingState();
+            });
     mappingTable->setCellWidget(row, 1, combo);
   }
+  updatePendingState();
 }
 
 void DockProfileManagerDialog::updateActionState() {
@@ -191,16 +203,18 @@ void DockProfileManagerDialog::createProfile() {
   if (!accepted)
     return;
 
+  syncMappingsFromTable();
+  const DockProfileStore before = workingStore;
+  const QMap<QString, QString> stagedMappings = workingStore.mappings();
   QString error;
   const QString id = workingStore.createProfile(
-      name, stateProvider(), obsVersionProvider(), &error);
+      name, stateProvider(), obsVersionProvider(), dockIdsProvider(), &error);
   if (id.isEmpty()) {
     showError(error);
     return;
   }
-  syncMappingsFromTable();
-  rebuildProfileList(id);
-  rebuildMappingTable();
+  commitProfileMutation(before, stagedMappings, id,
+                        text("Dock Profile created and saved."));
 }
 
 void DockProfileManagerDialog::renameProfile() {
@@ -216,14 +230,16 @@ void DockProfileManagerDialog::renameProfile() {
   if (!accepted)
     return;
 
+  syncMappingsFromTable();
+  const DockProfileStore before = workingStore;
+  const QMap<QString, QString> stagedMappings = workingStore.mappings();
   QString error;
   if (!workingStore.renameProfile(id, name, &error)) {
     showError(error);
     return;
   }
-  syncMappingsFromTable();
-  rebuildProfileList(id);
-  rebuildMappingTable();
+  commitProfileMutation(before, stagedMappings, id,
+                        text("Dock Profile renamed and saved."));
 }
 
 void DockProfileManagerDialog::deleteProfile() {
@@ -238,9 +254,17 @@ void DockProfileManagerDialog::deleteProfile() {
     return;
 
   syncMappingsFromTable();
+  const DockProfileStore before = workingStore;
+  QMap<QString, QString> stagedMappings = workingStore.mappings();
+  for (auto it = stagedMappings.begin(); it != stagedMappings.end();) {
+    if (it.value() == id)
+      it = stagedMappings.erase(it);
+    else
+      ++it;
+  }
   workingStore.deleteProfile(id);
-  rebuildProfileList();
-  rebuildMappingTable();
+  commitProfileMutation(before, stagedMappings, {},
+                        text("Dock Profile deleted."));
 }
 
 void DockProfileManagerDialog::loadProfileNow() {
@@ -264,17 +288,29 @@ void DockProfileManagerDialog::saveCurrentToProfile() {
     return;
 
   QString error;
+  syncMappingsFromTable();
+  const DockProfileStore before = workingStore;
+  const QMap<QString, QString> stagedMappings = workingStore.mappings();
   if (!workingStore.updateProfileState(id, stateProvider(),
-                                       obsVersionProvider(), &error))
+                                       obsVersionProvider(), dockIdsProvider(),
+                                       &error)) {
     showError(error);
+    return;
+  }
+  commitProfileMutation(before, stagedMappings, id,
+                        text("Current layout saved to Dock Profile."));
 }
 
 bool DockProfileManagerDialog::applyChanges(bool closeAfter) {
   syncMappingsFromTable();
-  QString error;
-  if (!applyCallback(workingStore, &error)) {
-    showError(error);
-    return false;
+  if (hasPendingAssignments()) {
+    QString error;
+    if (!applyCallback(workingStore, &error)) {
+      showError(error);
+      return false;
+    }
+    appliedMappings = workingStore.mappings();
+    updatePendingState(text("OBS profile assignments applied."));
   }
   if (closeAfter)
     QDialog::accept();
@@ -285,6 +321,11 @@ void DockProfileManagerDialog::refreshObsProfiles(
     const QStringList &obsProfiles_, const QString &currentObsProfile_,
     const QString &previousCurrent, bool allowRenameTransfer) {
   syncMappingsFromTable();
+  DockProfileStore appliedStore = workingStore;
+  appliedStore.replaceMappings(appliedMappings);
+  appliedStore.reconcileObsProfiles(obsProfiles_, previousCurrent,
+                                    currentObsProfile_, allowRenameTransfer);
+  appliedMappings = appliedStore.mappings();
   workingStore.reconcileObsProfiles(obsProfiles_, previousCurrent,
                                     currentObsProfile_, allowRenameTransfer);
   obsProfiles = obsProfiles_;
@@ -294,4 +335,69 @@ void DockProfileManagerDialog::refreshObsProfiles(
 
 void DockProfileManagerDialog::showError(const QString &message) {
   QMessageBox::critical(this, text("NuDock"), message);
+}
+
+bool DockProfileManagerDialog::hasPendingAssignments() const {
+  return workingStore.mappings() != appliedMappings;
+}
+
+void DockProfileManagerDialog::updatePendingState(const QString &status) {
+  const bool pending = hasPendingAssignments();
+  if (buttonBox)
+    buttonBox->button(QDialogButtonBox::Apply)->setEnabled(pending);
+  if (!status.isEmpty()) {
+    issueLabel->setText(
+        pending ? status + QLatin1Char('\n') +
+                      text("OBS profile assignment changes are pending.")
+                : status);
+    issueLabel->show();
+  } else if (pending) {
+    issueLabel->setText(text("OBS profile assignment changes are pending."));
+    issueLabel->show();
+  } else if (workingStore.issues().isEmpty()) {
+    issueLabel->hide();
+  }
+}
+
+bool DockProfileManagerDialog::commitProfileMutation(
+    const DockProfileStore &before,
+    const QMap<QString, QString> &stagedMappings,
+    const QString &preferredId, const QString &successStatus) {
+  QString error;
+  if (!profileCommitCallback(&workingStore, &error)) {
+    workingStore = before;
+    showError(error);
+    rebuildProfileList(preferredId);
+    rebuildMappingTable();
+    return false;
+  }
+
+  appliedMappings = workingStore.mappings();
+  workingStore.replaceMappings(stagedMappings);
+  rebuildProfileList(preferredId);
+  rebuildMappingTable();
+  updatePendingState(successStatus);
+  return true;
+}
+
+bool DockProfileManagerDialog::confirmDiscardAssignments() {
+  syncMappingsFromTable();
+  if (!hasPendingAssignments())
+    return true;
+  return QMessageBox::question(
+             this, text("Discard Assignment Changes"),
+             text("Discard unapplied OBS profile assignment changes?")) ==
+         QMessageBox::Yes;
+}
+
+void DockProfileManagerDialog::reject() {
+  if (confirmDiscardAssignments())
+    QDialog::reject();
+}
+
+void DockProfileManagerDialog::closeEvent(QCloseEvent *event) {
+  if (confirmDiscardAssignments())
+    event->accept();
+  else
+    event->ignore();
 }

@@ -8,6 +8,7 @@
 #include <util/bmem.h>
 
 #include <QAction>
+#include <QDockWidget>
 #include <QMainWindow>
 #include <QMenu>
 #include <QTimer>
@@ -59,10 +60,15 @@ NuDock::NuDock(QMainWindow *mainWindow_)
             if (!profile)
               return std::nullopt;
             return DockRestoreSnapshot{profile->id, profile->name,
-                                       profile->qtStateVersion, profile->state};
+                                       profile->qtStateVersion, profile->state,
+                                       profile->dockIds};
           },
           [this](const QByteArray &state, int stateVersion, QString *error) {
             return restoreStateTransactional(state, stateVersion, error);
+          },
+          [this]() { return currentDockIds(); },
+          [this](const QStringList &dockIds, QString *error) {
+            return restoreLateDocks(dockIds, error);
           },
           [this](int delay, std::function<void()> callback) {
             QTimer::singleShot(delay, this, std::move(callback));
@@ -164,12 +170,20 @@ void NuDock::showManager() {
       mainWindow, store, knownObsProfiles, knownCurrentObsProfile,
       []() { return QString::fromUtf8(obs_get_version_string()); },
       [this]() { return mainWindow->saveState(DockStateVersion); },
+      [this]() { return currentDockIds(); },
       [this](const QByteArray &state, QString *error) {
         restoreCoordinator.cancel();
         return restoreStateTransactional(state, DockStateVersion, error);
       },
       [this](const DockProfileStore &candidate, QString *error) {
         return applyStore(candidate, error);
+      },
+      [this](DockProfileStore *candidate, QString *error) {
+        candidate->replaceMappings(store.mappings());
+        if (!candidate->commit(error))
+          return false;
+        store = *candidate;
+        return true;
       });
   managerDialog->setAttribute(Qt::WA_DeleteOnClose);
   managerDialog->show();
@@ -178,10 +192,8 @@ void NuDock::showManager() {
 bool NuDock::applyStore(const DockProfileStore &candidate, QString *error) {
   const QString activeObsProfile = currentObsProfile();
   const QString oldDockProfile = store.mappingFor(activeObsProfile);
-  if (!candidate.commit(error))
+  if (!store.commitMappings(candidate.mappings(), error))
     return false;
-
-  store = candidate;
   const QString newDockProfile = store.mappingFor(activeObsProfile);
   if (oldDockProfile != newDockProfile) {
     if (newDockProfile.isEmpty())
@@ -196,11 +208,12 @@ bool NuDock::reconcileStoreWithObs(const QStringList &profiles,
                                    const QString &previousCurrent,
                                    const QString &current,
                                    bool allowRenameTransfer) {
-  if (!store.reconcileObsProfiles(profiles, previousCurrent, current,
-                                  allowRenameTransfer))
+  DockProfileStore candidate = store;
+  if (!candidate.reconcileObsProfiles(profiles, previousCurrent, current,
+                                      allowRenameTransfer))
     return false;
   QString error;
-  if (!store.commit(&error)) {
+  if (!store.commitMappings(candidate.mappings(), &error)) {
     blog(LOG_ERROR, "[%s] could not reconcile OBS profile mappings: %s",
          PLUGIN_NAME, error.toUtf8().constData());
     return false;
@@ -235,6 +248,37 @@ void NuDock::scheduleRestoreForCurrentProfile() {
 bool NuDock::restoreStateTransactional(const QByteArray &state,
                                        int stateVersion, QString *error) {
   return restoreDockStateTransactional(*mainWindow, state, stateVersion, error);
+}
+
+QStringList NuDock::currentDockIds() const {
+  QStringList result;
+  const QList<QDockWidget *> docks = mainWindow->findChildren<QDockWidget *>();
+  for (QDockWidget *dock : docks) {
+    if (dock && !dock->objectName().isEmpty())
+      result.push_back(dock->objectName());
+  }
+  result.removeDuplicates();
+  result.sort(Qt::CaseSensitive);
+  return result;
+}
+
+bool NuDock::restoreLateDocks(const QStringList &dockIds, QString *error) {
+  for (const QString &id : dockIds) {
+    QDockWidget *dock = nullptr;
+    const QList<QDockWidget *> docks = mainWindow->findChildren<QDockWidget *>();
+    for (QDockWidget *candidate : docks) {
+      if (candidate && candidate->objectName() == id) {
+        dock = candidate;
+        break;
+      }
+    }
+    if (!dock || !mainWindow->restoreDockWidget(dock)) {
+      if (error)
+        *error = QStringLiteral("Qt could not restore dock '%1'.").arg(id);
+      return false;
+    }
+  }
+  return true;
 }
 
 void NuDock::frontendEvent(enum obs_frontend_event event, void *data) {

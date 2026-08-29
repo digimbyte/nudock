@@ -41,6 +41,8 @@ private:
   void scheduleRestoreForCurrentProfile();
   bool restoreStateTransactional(const QByteArray &state, int stateVersion,
                                  QString *error = nullptr);
+  QStringList currentDockIds() const;
+  bool restoreLateDocks(const QStringList &dockIds, QString *error);
   bool applyStore(const DockProfileStore &candidate, QString *error);
   bool reconcileStoreWithObs(const QStringList &profiles,
                              const QString &previousCurrent,

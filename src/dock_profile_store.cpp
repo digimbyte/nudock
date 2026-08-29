@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
@@ -17,7 +18,7 @@
 namespace {
 constexpr auto ConfigFormat = "nudock.config";
 constexpr auto ProfileFormat = "nudock.profile";
-constexpr int SchemaVersion = 1;
+constexpr int SchemaVersion = 2;
 constexpr int DockStateVersion = 1;
 
 QString utcNow() {
@@ -64,8 +65,7 @@ QString DockProfileStore::profilesDirectory() const {
 bool DockProfileStore::isValidId(const QString &id) {
   const QUuid uuid(id);
   return !uuid.isNull() &&
-         uuid.toString(QUuid::WithoutBraces).compare(id,
-                                                     Qt::CaseInsensitive) == 0;
+         uuid.toString(QUuid::WithoutBraces) == id;
 }
 
 bool DockProfileStore::load(QString *error) {
@@ -81,34 +81,6 @@ bool DockProfileStore::load(QString *error) {
     setError(error,
              QStringLiteral("Could not create %1.").arg(profilesDirectory()));
     return false;
-  }
-
-  QSet<QString> names;
-  const QFileInfoList files = QDir(profilesDirectory())
-                                  .entryInfoList({QStringLiteral("*.json")},
-                                                 QDir::Files | QDir::Readable,
-                                                 QDir::Name);
-  for (const QFileInfo &file : files) {
-    DockProfile loaded;
-    QString profileError;
-    if (!readProfileFile(file.absoluteFilePath(), &loaded, &profileError)) {
-      issues_.push_back(profileError);
-      continue;
-    }
-    if (file.completeBaseName().compare(loaded.id, Qt::CaseInsensitive) != 0) {
-      issues_.push_back(QStringLiteral(
-                            "Ignored %1 because its filename does not match its ID.")
-                            .arg(file.fileName()));
-      continue;
-    }
-    const QString foldedName = loaded.name.toCaseFolded();
-    if (profiles_.contains(loaded.id) || names.contains(foldedName)) {
-      issues_.push_back(QStringLiteral("Ignored duplicate Dock Profile %1.")
-                            .arg(file.fileName()));
-      continue;
-    }
-    profiles_.insert(loaded.id, loaded);
-    names.insert(foldedName);
   }
 
   const QString configPath =
@@ -130,10 +102,68 @@ bool DockProfileStore::load(QString *error) {
   if (parseError.error != QJsonParseError::NoError || !document.isObject() ||
       root.value(QStringLiteral("format")).toString() != ConfigFormat ||
       root.value(QStringLiteral("version")).toInt(-1) != SchemaVersion ||
+      !root.value(QStringLiteral("profileIds")).isArray() ||
       !root.value(QStringLiteral("obsProfileBindings")).isObject()) {
     setError(error, QStringLiteral("%1 is not a valid NuDock configuration.")
                         .arg(configPath));
     return false;
+  }
+
+  QSet<QString> manifestIds;
+  QStringList manifestOrder;
+  const QJsonArray profileIds =
+      root.value(QStringLiteral("profileIds")).toArray();
+  for (const QJsonValue &value : profileIds) {
+    const QString id = value.isString() ? value.toString() : QString();
+    if (!isValidId(id) || manifestIds.contains(id)) {
+      setError(error,
+               QStringLiteral("%1 has an invalid Dock Profile manifest.")
+                   .arg(configPath));
+      profiles_.clear();
+      mappings_.clear();
+      return false;
+    }
+    manifestIds.insert(id);
+    manifestOrder.push_back(id);
+  }
+  QStringList sortedManifest = manifestOrder;
+  sortedManifest.sort(Qt::CaseSensitive);
+  if (manifestOrder != sortedManifest) {
+    setError(error,
+             QStringLiteral("%1 has an unsorted Dock Profile manifest.")
+                 .arg(configPath));
+    return false;
+  }
+
+  QSet<QString> names;
+  QStringList orderedIds = manifestIds.values();
+  orderedIds.sort(Qt::CaseInsensitive);
+  for (const QString &id : orderedIds) {
+    const QString path =
+        QDir(profilesDirectory()).filePath(id + QStringLiteral(".json"));
+    DockProfile loaded;
+    QString profileError;
+    if (!readProfileFile(path, &loaded, &profileError)) {
+      issues_.push_back(
+          QStringLiteral("Manifested Dock Profile %1 is missing or invalid: %2")
+              .arg(id, profileError));
+      continue;
+    }
+    if (loaded.id != id) {
+      issues_.push_back(
+          QStringLiteral("Manifested Dock Profile %1 has a mismatched ID.")
+              .arg(id));
+      continue;
+    }
+    const QString foldedName = loaded.name.toCaseFolded();
+    if (names.contains(foldedName)) {
+      issues_.push_back(
+          QStringLiteral("Ignored duplicate manifested Dock Profile %1.")
+              .arg(id));
+      continue;
+    }
+    profiles_.insert(loaded.id, loaded);
+    names.insert(foldedName);
   }
 
   const QJsonObject bindings =
@@ -179,6 +209,7 @@ bool DockProfileStore::readProfileFile(const QString &path,
       !root.value(QStringLiteral("obsVersion")).isString() ||
       root.value(QStringLiteral("qtStateVersion")).toInt(-1) !=
           DockStateVersion ||
+      !root.value(QStringLiteral("dockIds")).isArray() ||
       !root.value(QStringLiteral("state")).isString()) {
     setError(error,
              QStringLiteral("Ignored invalid Dock Profile file %1.").arg(path));
@@ -187,20 +218,32 @@ bool DockProfileStore::readProfileFile(const QString &path,
 
   DockProfile result;
   result.id = root.value(QStringLiteral("id")).toString();
-  result.name = root.value(QStringLiteral("name")).toString().trimmed();
+  const QString storedName = root.value(QStringLiteral("name")).toString();
+  result.name = storedName.trimmed();
   result.createdAtUtc = root.value(QStringLiteral("createdAtUtc")).toString();
   result.updatedAtUtc = root.value(QStringLiteral("updatedAtUtc")).toString();
   result.obsVersion = root.value(QStringLiteral("obsVersion")).toString();
   result.qtStateVersion = root.value(QStringLiteral("qtStateVersion")).toInt();
+  const QJsonArray dockIds = root.value(QStringLiteral("dockIds")).toArray();
+  for (const QJsonValue &value : dockIds) {
+    if (!value.isString() || value.toString().trimmed().isEmpty()) {
+      setError(error,
+               QStringLiteral("Ignored invalid Dock Profile file %1.").arg(path));
+      return false;
+    }
+    result.dockIds.push_back(value.toString());
+  }
 
   const auto decoded = QByteArray::fromBase64Encoding(
       root.value(QStringLiteral("state")).toString().toLatin1(),
       QByteArray::AbortOnBase64DecodingErrors);
   if (!isValidId(result.id) || result.name.isEmpty() ||
+      result.name != storedName ||
       result.obsVersion.trimmed().isEmpty() ||
       !isUtcTimestamp(result.createdAtUtc) ||
       !isUtcTimestamp(result.updatedAtUtc) || !decoded ||
-      decoded.decoded.isEmpty()) {
+      decoded.decoded.isEmpty() ||
+      result.dockIds != normalizedDockIds(result.dockIds)) {
     setError(error,
              QStringLiteral("Ignored invalid Dock Profile file %1.").arg(path));
     return false;
@@ -235,11 +278,16 @@ bool DockProfileStore::validateName(const QString &name,
 QString DockProfileStore::createProfile(const QString &name,
                                         const QByteArray &state,
                                         const QString &obsVersion,
+                                        const QStringList &dockIds,
                                         QString *error) {
   if (!validateName(name, {}, error))
     return {};
   if (state.isEmpty()) {
     setError(error, QStringLiteral("OBS returned an empty dock state."));
+    return {};
+  }
+  if (obsVersion.trimmed().isEmpty()) {
+    setError(error, QStringLiteral("OBS version is unavailable."));
     return {};
   }
 
@@ -251,6 +299,7 @@ QString DockProfileStore::createProfile(const QString &name,
   profile.obsVersion = obsVersion;
   profile.qtStateVersion = DockStateVersion;
   profile.state = state;
+  profile.dockIds = normalizedDockIds(dockIds);
   profiles_.insert(profile.id, profile);
   return profile.id;
 }
@@ -273,6 +322,7 @@ bool DockProfileStore::renameProfile(const QString &id, const QString &name,
 bool DockProfileStore::updateProfileState(const QString &id,
                                           const QByteArray &state,
                                           const QString &obsVersion,
+                                          const QStringList &dockIds,
                                           QString *error) {
   auto it = profiles_.find(id);
   if (it == profiles_.end()) {
@@ -284,9 +334,14 @@ bool DockProfileStore::updateProfileState(const QString &id,
     setError(error, QStringLiteral("OBS returned an empty dock state."));
     return false;
   }
+  if (obsVersion.trimmed().isEmpty()) {
+    setError(error, QStringLiteral("OBS version is unavailable."));
+    return false;
+  }
   it->state = state;
   it->obsVersion = obsVersion;
   it->qtStateVersion = DockStateVersion;
+  it->dockIds = normalizedDockIds(dockIds);
   it->updatedAtUtc = utcNow();
   return true;
 }
@@ -329,6 +384,24 @@ void DockProfileStore::setMapping(const QString &obsProfileName,
     mappings_.insert(obsProfileName, dockProfileId);
 }
 
+void DockProfileStore::replaceMappings(
+    const QMap<QString, QString> &mappings) {
+  mappings_.clear();
+  for (auto it = mappings.constBegin(); it != mappings.constEnd(); ++it)
+    setMapping(it.key(), it.value());
+}
+
+QStringList DockProfileStore::normalizedDockIds(const QStringList &dockIds) {
+  QSet<QString> unique;
+  for (const QString &id : dockIds) {
+    if (!id.trimmed().isEmpty())
+      unique.insert(id);
+  }
+  QStringList result = unique.values();
+  result.sort(Qt::CaseSensitive);
+  return result;
+}
+
 bool DockProfileStore::reconcileObsProfiles(const QStringList &obsProfiles,
                                             const QString &previousCurrent,
                                             const QString &current,
@@ -366,6 +439,10 @@ bool DockProfileStore::writeProfileFile(const DockProfile &profile,
   root.insert(QStringLiteral("updatedAtUtc"), profile.updatedAtUtc);
   root.insert(QStringLiteral("obsVersion"), profile.obsVersion);
   root.insert(QStringLiteral("qtStateVersion"), profile.qtStateVersion);
+  QJsonArray dockIds;
+  for (const QString &id : normalizedDockIds(profile.dockIds))
+    dockIds.push_back(id);
+  root.insert(QStringLiteral("dockIds"), dockIds);
   root.insert(QStringLiteral("state"),
               QString::fromLatin1(profile.state.toBase64()));
   return writeJsonAtomically(
@@ -373,15 +450,20 @@ bool DockProfileStore::writeProfileFile(const DockProfile &profile,
       root, error);
 }
 
-bool DockProfileStore::writeConfigFile(QString *error) const {
+bool DockProfileStore::writeConfigFile(
+    const QMap<QString, QString> &mappings, QString *error) const {
   QJsonObject bindings;
-  for (auto it = mappings_.constBegin(); it != mappings_.constEnd(); ++it) {
+  for (auto it = mappings.constBegin(); it != mappings.constEnd(); ++it) {
     if (profiles_.contains(it.value()))
       bindings.insert(it.key(), it.value());
   }
+  QJsonArray profileIds;
+  for (auto it = profiles_.constBegin(); it != profiles_.constEnd(); ++it)
+    profileIds.push_back(it.key());
   QJsonObject root;
   root.insert(QStringLiteral("format"), ConfigFormat);
   root.insert(QStringLiteral("version"), SchemaVersion);
+  root.insert(QStringLiteral("profileIds"), profileIds);
   root.insert(QStringLiteral("obsProfileBindings"), bindings);
   return writeJsonAtomically(
       QDir(rootDirectory_).filePath(QStringLiteral("config.json")), root,
@@ -398,21 +480,39 @@ bool DockProfileStore::commit(QString *error) const {
     if (!writeProfileFile(profile, error))
       return false;
   }
-  if (!writeConfigFile(error))
+  if (!writeConfigFile(mappings_, error))
     return false;
 
+  cleanOrphanFiles();
+  return true;
+}
+
+void DockProfileStore::cleanOrphanFiles() const {
   const QFileInfoList existing = QDir(profilesDirectory())
                                      .entryInfoList({QStringLiteral("*.json")},
                                                     QDir::Files, QDir::Name);
   for (const QFileInfo &file : existing) {
     const QString id = file.completeBaseName();
-    if (isValidId(id) && !profiles_.contains(id) &&
-        !QFile::remove(file.absoluteFilePath())) {
-      setError(error,
-               QStringLiteral("Could not remove deleted Dock Profile %1.")
-                   .arg(file.fileName()));
-      return false;
-    }
+    if (!profiles_.contains(id))
+      QFile::remove(file.absoluteFilePath());
   }
+}
+
+bool DockProfileStore::commitMappings(
+    const QMap<QString, QString> &mappings, QString *error) {
+  QMap<QString, QString> valid;
+  for (auto it = mappings.constBegin(); it != mappings.constEnd(); ++it) {
+    if (!it.key().trimmed().isEmpty() && profiles_.contains(it.value()))
+      valid.insert(it.key(), it.value());
+  }
+  if (rootDirectory_.isEmpty() || !QDir().mkpath(profilesDirectory())) {
+    setError(error,
+             QStringLiteral("Could not create the NuDock profile directory."));
+    return false;
+  }
+  if (!writeConfigFile(valid, error))
+    return false;
+  mappings_ = valid;
+  cleanOrphanFiles();
   return true;
 }

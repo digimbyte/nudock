@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28...3.31)
 
-project(nudock VERSION 2.0.0 LANGUAGES CXX)
+project(nudock VERSION 2.1.0 LANGUAGES CXX)
 
 find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Widgets)
 

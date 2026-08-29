@@ -14,6 +14,7 @@ struct DockProfile {
   QString obsVersion;
   int qtStateVersion = 1;
   QByteArray state;
+  QStringList dockIds;
 };
 
 class DockProfileStore {
@@ -22,6 +23,8 @@ public:
 
   bool load(QString *error = nullptr);
   bool commit(QString *error = nullptr) const;
+  bool commitMappings(const QMap<QString, QString> &mappings,
+                      QString *error = nullptr);
 
   const QMap<QString, DockProfile> &profiles() const { return profiles_; }
   const QMap<QString, QString> &mappings() const { return mappings_; }
@@ -30,17 +33,19 @@ public:
   const DockProfile *profile(const QString &id) const;
 
   QString createProfile(const QString &name, const QByteArray &state,
-                        const QString &obsVersion, QString *error = nullptr);
+                        const QString &obsVersion, const QStringList &dockIds,
+                        QString *error = nullptr);
   bool renameProfile(const QString &id, const QString &name,
                      QString *error = nullptr);
   bool updateProfileState(const QString &id, const QByteArray &state,
-                          const QString &obsVersion,
+                          const QString &obsVersion, const QStringList &dockIds,
                           QString *error = nullptr);
   void deleteProfile(const QString &id);
 
   QString mappingFor(const QString &obsProfileName) const;
   void setMapping(const QString &obsProfileName,
                   const QString &dockProfileId);
+  void replaceMappings(const QMap<QString, QString> &mappings);
   bool reconcileObsProfiles(const QStringList &obsProfiles,
                             const QString &previousCurrent,
                             const QString &current,
@@ -61,6 +66,9 @@ private:
   bool readProfileFile(const QString &path, DockProfile *profile,
                        QString *error) const;
   bool writeProfileFile(const DockProfile &profile, QString *error) const;
-  bool writeConfigFile(QString *error) const;
+  bool writeConfigFile(const QMap<QString, QString> &mappings,
+                       QString *error) const;
+  void cleanOrphanFiles() const;
+  static QStringList normalizedDockIds(const QStringList &dockIds);
   static void setError(QString *target, const QString &message);
 };
