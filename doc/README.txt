@@ -1,5 +1,5 @@
 NuDock dock profile manager for OBS Studio
-Version 2.0.0
+Version 2.1.0
 https://github.com/digimbyte/nudock
 
 WHAT NUDOCK DOES
@@ -33,7 +33,7 @@ Standalone or portable OBS layout:
 Start OBS and open Docks > NuDock Profiles.... A successful installation also
 logs a line containing:
 
-  [nudock] loaded version 2.0.0
+  [nudock] loaded version 2.1.0
 
 USAGE
 
@@ -62,22 +62,26 @@ OBS Profile Assignments
   New OBS profiles start unassigned.
 
 Apply
-  Commits all staged Dock Profile and assignment edits. If the active OBS
-  profile receives a new assignment, that Dock Profile loads immediately.
+  Commits staged OBS profile assignments. If the active OBS profile receives a
+  new assignment, that Dock Profile loads immediately.
 
 OK
   Applies staged changes and closes the manager.
 
 Cancel
-  Discards staged profile and assignment edits. A temporary Load Now operation
-  is not reversed.
+  Discards only staged assignment edits after confirmation. Create, Rename,
+  Delete, and Save Current to Profile are already durable. A temporary Load Now
+  operation is not reversed.
 
 RESTORE RULES
 
 - Assigned layouts restore after OBS finishes loading and after OBS profile
   changes.
-- Immediate, short, and late retries accommodate docks created by other plugins.
-- Rapid profile changes cancel stale retries.
+- The full layout is restored once, then dock IDs are polled for five seconds
+  without changing the layout.
+- Docks created late use targeted restoration. One full fallback is allowed if
+  targeted restoration fails.
+- Rapid profile changes cancel stale polling and restoration.
 - If Qt rejects a saved state, NuDock restores the layout present immediately
   before that attempt.
 - Normal dock rearrangement is never saved automatically.
@@ -90,8 +94,10 @@ places it under its global plugin configuration directory:
   plugin_config\nudock\config.json
   plugin_config\nudock\profiles\<uuid>.json
 
-NuDock validates every file before use and uses atomic writes. Invalid or
-missing Dock Profiles are reported and are not applied to the current layout.
+Schema v2 uses config.json as an authoritative manifest and transaction commit
+point. NuDock writes profile files atomically before publishing the manifest.
+Invalid or missing manifested profiles are reported, and unmanifested orphan
+files are ignored and later cleaned. Schema v1 data is not imported.
 
 TROUBLESHOOTING
 
@@ -100,9 +106,10 @@ NuDock Profiles... is missing
   layout, and the current OBS log does not report a module load failure.
 
 A newly installed plugin dock is not positioned on the first attempt
-  Leave the assigned profile active long enough for the late retry. If the new
-  dock was not part of the saved layout, arrange it and use Save Current to
-  Profile once.
+  Leave the assigned profile active for the five-second late-dock grace window.
+  The owning plugin must register the dock with the same stable ID saved in the
+  Dock Profile. If the dock was not part of the snapshot, arrange it and use
+  Save Current to Profile once.
 
 A temporary arrangement reset after switching OBS profiles
   This is expected for an assigned OBS profile. Use Save Current to Profile to

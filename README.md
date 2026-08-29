@@ -1,6 +1,6 @@
 # NuDock
 
-NuDock 2.0 is an OBS Studio plugin that saves explicit Dock Profiles and maps
+NuDock 2.1 is an OBS Studio plugin that saves explicit Dock Profiles and maps
 them to OBS profiles. It restores the intended layout after startup and OBS
 profile transitions without continuously fighting temporary dock changes.
 
@@ -13,14 +13,19 @@ Open **Docks > NuDock Profiles...** to:
 - assign each OBS profile a Dock Profile or **Keep Current**;
 - share one Dock Profile between any number of OBS profiles.
 
-Changes in the manager are staged until **Apply** or **OK**. **Load Now** only
-changes the live layout and never changes an assignment. Rearranging docks in
-OBS is temporary until **Save Current to Profile** is used.
+Create, Rename, Delete, and **Save Current to Profile** are durable immediately.
+Only OBS-profile assignments are staged until **Apply** or **OK**; **Cancel**
+asks before discarding pending assignment edits. **Load Now** only changes the
+live layout and never changes an assignment. Rearranging docks in OBS is
+temporary until **Save Current to Profile** is used.
 
-On startup and profile transitions, NuDock retries restoration on the OBS UI
-thread at immediate, short, and late intervals. Each retry is generation
-guarded, so rapid switches cannot apply a stale profile. A rejected Qt state is
-rolled back to the layout captured immediately before that attempt.
+On startup and profile transitions, NuDock applies the complete snapshot once.
+For five seconds it polls the registered dock IDs without changing the layout.
+A dock that appears late is restored through Qt's targeted dock path, preserving
+temporary edits to existing docks. One transactional full fallback is allowed
+if targeted restoration fails. Generation guards cancel stale work during rapid
+switches, and a rejected Qt state is rolled back to the layout captured before
+the attempt.
 
 ## Storage
 
@@ -32,10 +37,12 @@ plugin_config/nudock/
   profiles/<uuid>.json
 ```
 
-`config.json` contains the schema version and OBS-profile-to-Dock-Profile UUID
-assignments. Each profile file contains a stable UUID, unique display name,
-creation and update timestamps, OBS version, Qt state version, and base64 dock
-state. Files are schema validated and committed with `QSaveFile`.
+Schema v2 `config.json` contains an authoritative Dock Profile UUID manifest and
+OBS-profile assignments. Each manifested profile contains its stable UUID,
+unique display name, timestamps, OBS and Qt state versions, sorted stable dock
+IDs, and base64 Qt state. Profile files are atomically written before the config
+manifest is published as the transaction commit point. Unmanifested orphan
+files are ignored and cleaned later; schema v1 data is not imported.
 
 NuDock does not read, migrate, scan, or delete configuration belonging to any
 other plugin.
@@ -52,11 +59,10 @@ Enable the self-contained Qt test executable with:
 -DNUDOCK_BUILD_TESTS=ON
 ```
 
-The suite covers serialization, atomic writes, duplicate names, CRUD,
-many-to-one mappings, OBS profile rename/delete reconciliation, corrupt and
-missing files, mapped profile transitions, rapid-switch cancellation, custom
-dock layout round-trips, late dock registration, and transactional restore
-rollback.
+The suite covers schema-v2 transactions and orphan handling, strict no-import
+behavior, immediate profile persistence, staged mappings, mapped transitions,
+rapid-switch cancellation, custom dock layout round-trips, targeted late-dock
+restoration, bounded failure handling, and transactional rollback.
 
 Compatibility targets are OBS Studio 32.1 and 32.2 on Windows x64. Local OBS
 source trees, portable installations, build outputs, packages, DLLs, and PDBs
